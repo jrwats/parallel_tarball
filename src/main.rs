@@ -1,13 +1,13 @@
 use anyhow::Context;
 use futures::{stream, StreamExt, TryStreamExt};
 use rayon::prelude::*;
-use tokio::io::AsyncReadExt;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::io::AsyncReadExt;
 use walkdir::WalkDir;
 
 fn maybe_open<P: AsRef<Path>>(path: P) -> anyhow::Result<Option<File>> {
@@ -20,7 +20,7 @@ fn maybe_open<P: AsRef<Path>>(path: P) -> anyhow::Result<Option<File>> {
                 // eprintln!("{:?}", e);
                 Ok(None)
                 // Err(e).context(format!("Failed opening {:#?}", path.as_ref()))
-            },
+            }
         },
     }
 }
@@ -37,7 +37,11 @@ fn get_bytes(file: &mut File) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn append_path_data<W: Write>(tar: &mut tar::Builder<W>, path: &Path, buf: &[u8]) -> anyhow::Result<()> {
+fn append_path_data<W: Write>(
+    tar: &mut tar::Builder<W>,
+    path: &Path,
+    buf: &[u8],
+) -> anyhow::Result<()> {
     let mut header = tar::Header::new_gnu();
     header.set_size(buf.len() as u64);
     // let mut tar = tar_lock.lock().unwrap();
@@ -55,7 +59,7 @@ async fn sync_add_to_tar<W: Write>(
         let buf = get_bytes(&mut file)?;
         let mut tar = tar_lock.lock().unwrap();
         append_path_data(&mut tar, &path, &buf)?;
-        return Ok(blake_hash(&buf))
+        return Ok(blake_hash(&buf));
     }
     Ok("".into())
 }
@@ -81,7 +85,7 @@ async fn _async_add_to_tar<W: Write>(
             Ok(buf.len())
         }
         _ => {
-            // eprintln!("Failed reading {:#?}", read_path); 
+            // eprintln!("Failed reading {:#?}", read_path);
             Ok(0)
         }
     }
@@ -104,11 +108,13 @@ impl Write for Buf {
 async fn spawned_hash<W: 'static + Write + Send>(
     tar_lock: Arc<Mutex<tar::Builder<W>>>,
     path: &Path,
-    dir: &Path
+    dir: &Path,
 ) -> anyhow::Result<(PathBuf, String)> {
     let p = path.to_owned();
     let d = dir.to_owned();
-    let hash = tokio::spawn(sync_add_to_tar(tar_lock.clone(), p.clone(), d)).await.unwrap()?;
+    let hash = tokio::spawn(sync_add_to_tar(tar_lock.clone(), p.clone(), d))
+        .await
+        .unwrap()?;
     Ok((p, hash))
 }
 
@@ -118,16 +124,13 @@ async fn par_stream_tar(
 ) -> anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)> {
     let buf = Arc::new(Mutex::new(std::io::Cursor::new(vec![])));
     let checksums = {
-        let encoder =
-            zstd::stream::write::Encoder::new(Buf(buf.clone()), 0)
+        let encoder = zstd::stream::write::Encoder::new(Buf(buf.clone()), 0)
             .context("setting up zstd encoder")?
             .auto_finish();
         let tar_lock = Arc::new(Mutex::new(tar::Builder::new(encoder)));
 
         let sums: HashMap<PathBuf, String> = stream::iter(paths)
-            .map(|path| async {
-                spawned_hash(tar_lock.clone(), path, dir).await
-            })
+            .map(|path| async { spawned_hash(tar_lock.clone(), path, dir).await })
             .buffer_unordered(2000)
             .try_collect::<Vec<(PathBuf, String)>>()
             .await
@@ -143,14 +146,10 @@ async fn par_stream_tar(
     Ok((cursor.into_inner(), checksums))
 }
 
-fn rayon_tar(
-    dir: &Path,
-    paths: &[PathBuf],
-) -> anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)> {
+fn rayon_tar(dir: &Path, paths: &[PathBuf]) -> anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)> {
     let mut bytes: Vec<u8> = Vec::new();
     let checksums = {
-        let encoder =
-            zstd::stream::write::Encoder::new(&mut bytes, 0)
+        let encoder = zstd::stream::write::Encoder::new(&mut bytes, 0)
             .context("setting up zstd encoder")?
             .auto_finish();
         let tar_lock = Arc::new(Mutex::new(tar::Builder::new(encoder)));
@@ -162,7 +161,7 @@ fn rayon_tar(
                     let mut tar = tar_lock.lock().unwrap();
                     append_path_data(&mut tar, &path, &buf)?;
                     let hash = blake_hash(&buf);
-                    return Ok(Some((PathBuf::from(path), hash)))
+                    return Ok(Some((PathBuf::from(path), hash)));
                 }
                 Ok(None)
             })
@@ -183,12 +182,12 @@ async fn rayon_par2sync(
     paths: &[PathBuf],
 ) -> anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)> {
     let handle = {
-        let (send, recv): (std::sync::mpsc::SyncSender<(PathBuf, Vec<u8>, String)>, _) = std::sync::mpsc::sync_channel(rayon::current_num_threads());
+        let (send, recv): (std::sync::mpsc::SyncSender<(PathBuf, Vec<u8>, String)>, _) =
+            std::sync::mpsc::sync_channel(rayon::current_num_threads());
         let handle = tokio::spawn(async move {
             let mut bytes: Vec<u8> = vec![];
             let checksums = {
-                let encoder =
-                    zstd::stream::write::Encoder::new(&mut bytes, 0)
+                let encoder = zstd::stream::write::Encoder::new(&mut bytes, 0)
                     .context("setting up zstd encoder")?
                     .auto_finish();
                 let mut tar = tar::Builder::new(encoder);
@@ -222,12 +221,9 @@ async fn rayon_par2sync(
     Ok(res?)
 }
 
-fn sync_tar(
-    dir: &Path,
-    paths: &[PathBuf],
-    ) -> anyhow::Result<Vec<u8>> {
+fn sync_tar(dir: &Path, paths: &[PathBuf]) -> anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)> {
     let mut bytes: Vec<u8> = Vec::new();
-    {
+    let checksums = {
         let encoder =
             zstd::stream::write::Encoder::new(&mut bytes, 0).context("setting up zstd encoder")?;
         let mut tar = tar::Builder::new(encoder);
@@ -242,11 +238,12 @@ fn sync_tar(
                 }
                 Ok(())
             })
-        .collect::<anyhow::Result<Vec<()>>>()
+            .collect::<anyhow::Result<Vec<()>>>()
             .context("writing tar file")?;
         tar.finish().context("writing tarball")?;
-    }
-    Ok(bytes)
+        checksums
+    };
+    Ok((bytes, checksums))
 }
 
 // Helper panics on assert, but not before ensuring we spew a useful error
@@ -269,19 +266,22 @@ async fn main() -> anyhow::Result<()> {
 
     let paths: Vec<PathBuf> = WalkDir::new(&dir)
         .into_iter()
-        .filter_map(|r| r.ok().and_then(|e| {
-            (!e.path().is_dir()).then(|| rel_path(e.path(), &dir).to_owned())
-        }))
+        .filter_map(|r| {
+            r.ok()
+                .and_then(|e| (!e.path().is_dir()).then(|| rel_path(e.path(), &dir).to_owned()))
+        })
         .collect();
 
     // dummy call to warm up the disk
-    let _bytes = sync_tar(&dir, &paths)?;
+    let (_, _) = rayon_par2sync(&dir, &paths).await?;
 
     let mut bs: HashMap<String, usize> = HashMap::new();
+    let mut csums: HashMap<String, HashMap<PathBuf, String>> = HashMap::new();
     let rayon_st = Instant::now();
     for _i in 0..ITER {
         let (rbytes, r_csums) = rayon_tar(&dir, &paths)?;
         bs.insert("rayon".into(), rbytes.len());
+        csums.insert("rayon".into(), r_csums);
     }
     let rayon_elapsed = rayon_st.elapsed();
 
@@ -289,27 +289,36 @@ async fn main() -> anyhow::Result<()> {
     for _i in 0..ITER {
         let (rbytes, rp_csums) = rayon_par2sync(&dir, &paths).await?;
         bs.insert("rayon p2s".into(), rbytes.len());
+        csums.insert("rayon p2s".into(), rp_csums);
     }
     let rayon_s_elapsed = rayon_s_st.elapsed();
 
     let parallel_st = Instant::now();
     for _i in 0..ITER {
-        let (pbytes, p_checksums) = par_stream_tar(&dir, &paths).await?;
+        let (pbytes, p_csums) = par_stream_tar(&dir, &paths).await?;
         bs.insert("parallel".into(), pbytes.len());
+        csums.insert("parallel".into(), p_csums);
     }
     let par_elapsed = parallel_st.elapsed();
-    
+
     let sync_time = Instant::now();
     for _i in 0..ITER {
-        let sbytes = sync_tar(&dir, &paths)?;
+        let (sbytes, s_csums) = sync_tar(&dir, &paths)?;
         bs.insert("syn".into(), sbytes.len());
+        csums.insert("syn".into(), s_csums);
     }
     let sync_elapsed = sync_time.elapsed();
 
     println!("     rayon: {:?}", rayon_elapsed);
-    println!("rayon p2s: {:?}", rayon_s_elapsed);
+    println!(" rayon p2s: {:?}", rayon_s_elapsed);
     println!("  parallel: {:?}", par_elapsed);
-    println!("      sync: {:?}", sync_elapsed );
+    println!("      sync: {:?}", sync_elapsed);
+
+    let mut iter = csums.iter();
+    let first = iter.next().unwrap();
+    for win in iter {
+        assert_eq!(first.1, win.1);
+    }
 
     println!("{:?}", bs);
     Ok(())
@@ -325,7 +334,9 @@ mod test {
         let dir = tempfile::tempdir()?;
         let tmpdir = PathBuf::from(dir.path());
         let mut foo = File::create(tmpdir.join("foo.txt"))?;
-        let strs: Vec<String> = iter::repeat(String::from("abcdefghijklmnopqrstuvwxyz")).take(100).collect();
+        let strs: Vec<String> = iter::repeat(String::from("abcdefghijklmnopqrstuvwxyz"))
+            .take(100)
+            .collect();
         let content = strs.join("_");
         foo.write_all(content.as_bytes())?;
         let files = vec![PathBuf::from("foo.txt")];
