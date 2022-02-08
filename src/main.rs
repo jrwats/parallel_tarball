@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use futures::{stream, StreamExt, TryStreamExt};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -10,17 +10,22 @@ use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use walkdir::WalkDir;
 
+fn naive_open<P: AsRef<Path>>(path: P) -> anyhow::Result<Option<File>> {
+    match File::open(path.as_ref()) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::NotFound => Ok(None),
+            _kind => Ok(None) // eat the error
+        },
+    }
+}
+
 fn maybe_open<P: AsRef<Path>>(path: P) -> anyhow::Result<Option<File>> {
     match File::open(path.as_ref()) {
         Ok(f) => Ok(Some(f)),
         Err(e) => match e.kind() {
             std::io::ErrorKind::NotFound => Ok(None),
-            _kind => {
-                // eprintln!("{:?}", kind);
-                // eprintln!("{:?}", e);
-                Ok(None)
-                // Err(e).context(format!("Failed opening {:#?}", path.as_ref()))
-            }
+            _kind => Err(anyhow!(e)),
         },
     }
 }
@@ -44,7 +49,6 @@ fn append_path_data<W: Write>(
 ) -> anyhow::Result<()> {
     let mut header = tar::Header::new_gnu();
     header.set_size(buf.len() as u64);
-    // let mut tar = tar_lock.lock().unwrap();
     tar.append_data(&mut header, &path, buf)
         .with_context(|| format!("appending {:#?}", &path))?;
     Ok(())
@@ -55,7 +59,7 @@ async fn sync_add_to_tar<W: Write>(
     path: PathBuf,
     dir: PathBuf,
 ) -> anyhow::Result<String> {
-    if let Some(mut file) = maybe_open(dir.join(&path))? {
+    if let Some(mut file) = naive_open(dir.join(&path))? {
         let buf = get_bytes(&mut file)?;
         let mut tar = tar_lock.lock().unwrap();
         append_path_data(&mut tar, &path, &buf)?;
@@ -79,13 +83,11 @@ async fn _async_add_to_tar<W: Write>(
             let mut header = tar::Header::new_gnu();
             header.set_size(buf.len() as u64);
             let mut tar = tar_lock.lock().unwrap();
-            // eprintln!("appending: {:#?}", path);
             tar.append_data(&mut header, &path, buf.as_slice())
                 .with_context(|| format!("appending {:#?}", &path))?;
             Ok(buf.len())
         }
         _ => {
-            // eprintln!("Failed reading {:#?}", read_path);
             Ok(0)
         }
     }
@@ -156,7 +158,7 @@ fn rayon_tar(dir: &Path, paths: &[PathBuf]) -> anyhow::Result<(Vec<u8>, HashMap<
         let checksums: HashMap<PathBuf, String> = paths
             .par_iter()
             .map(|path| -> anyhow::Result<Option<(PathBuf, String)>> {
-                if let Some(mut file) = maybe_open(PathBuf::from(dir).join(path))? {
+                if let Some(mut file) = naive_open(PathBuf::from(dir).join(path))? {
                     let buf = get_bytes(&mut file)?;
                     let mut tar = tar_lock.lock().unwrap();
                     append_path_data(&mut tar, &path, &buf)?;
@@ -204,17 +206,24 @@ async fn rayon_par2sync(
             Ok::<(Vec<u8>, HashMap<PathBuf, String>), anyhow::Error>((bytes, checksums))
         });
 
-        let _: Vec<anyhow::Result<()>> = paths
+        let read_errs: Vec<_> = paths
             .par_iter()
             .map(|path: &PathBuf| -> anyhow::Result<()> {
                 if let Some(mut file) = maybe_open(PathBuf::from(dir).join(path))? {
-                    let buf: Vec<u8> = get_bytes(&mut file)?;
+                    let buf: Vec<u8> = get_bytes(&mut file)
+                        .with_context(|| format!("reading {:#?}", path))?;
                     let hash = blake_hash(&buf);
                     send.send((path.clone(), buf, hash))?;
                 }
                 Ok(())
             })
+            .filter(Result::is_err)
             .collect();
+
+            eprintln!("errs.len(): {}", read_errs.len());
+            for e in read_errs {
+                eprintln!("{:?}", e);
+            }
         handle
     };
     let res = handle.await?;
@@ -231,7 +240,7 @@ fn sync_tar(dir: &Path, paths: &[PathBuf]) -> anyhow::Result<(Vec<u8>, HashMap<P
         let _results: Vec<()> = paths
             .iter()
             .map(|path| -> anyhow::Result<()> {
-                if let Some(mut file) = maybe_open(PathBuf::from(dir).join(path))? {
+                if let Some(mut file) = naive_open(PathBuf::from(dir).join(path))? {
                     let buf: Vec<u8> = get_bytes(&mut file)?;
                     checksums.insert(PathBuf::from(path), blake_hash(&buf));
                     append_path_data(&mut tar, path, &buf)?;
@@ -255,7 +264,7 @@ fn rel_path<'a, 'b>(child: &'a Path, parent: &'b Path) -> &'a Path {
     res.unwrap()
 }
 
-const ITER: i32 = 1;
+const ITER: i32 = 4;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
