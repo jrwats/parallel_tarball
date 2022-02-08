@@ -2,18 +2,17 @@ use anyhow::{anyhow, Context};
 use core::time::Duration;
 use derive_more::{Display};
 use futures::{
-    stream, Future, StreamExt, TryStreamExt,
-    future::BoxFuture
+    stream, StreamExt, TryStreamExt,
 };
-use maplit::hashmap;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::str::FromStr;
 use std::io::{self, IoSliceMut, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use strum_macros::EnumString;
 use tokio::io::AsyncReadExt;
 use walkdir::WalkDir;
 
@@ -26,7 +25,7 @@ struct HashingReader {
 impl Read for HashingReader {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.file.read(buf)?; // we're losing time here
+        let n = self.file.read(buf)?;
         self.hasher.update(&buf[0..n]);
         Ok(n)
     }
@@ -49,44 +48,6 @@ impl HashingReader {
         self.hasher.finalize().to_string()
     }
 }
-
-/*
-struct MmapHashingReader {
-    file: File,
-    hasher: blake3::Hasher,
-    len: u64,
-}
-
-impl MMapHashingReader {
-    fn try_new(file: File) -> anyhow::Result<Self> {
-        let metadata = file.metadata().context("reading metadata")?;
-        let len = metadata.len();
-        let hasher = blake3::Hasher::new();
-        Ok(Self { file, hasher, len })
-    }
-
-    fn len(&self) -> u64 {
-        self.len
-    }
-
-    #[inline]
-    fn finalize(&self) -> String {
-        self.hasher.finalize().to_string()
-    }
-}
-*/
-
-// impl std::io::SizeHint for HashingReader {
-//     #[inline]
-//     fn lower_bound(&self) -> usize {
-//         0
-//     }
-//
-//     #[inline]
-//     fn upper_bound(&self) -> Option<usize> {
-//         self.len
-//     }
-// }
 
 fn naive_open<P: AsRef<Path>>(path: P) -> anyhow::Result<Option<File>> {
     match File::open(path.as_ref()) {
@@ -145,29 +106,27 @@ async fn locked_hashed_read<W: Write>(
     tar_lock: Arc<Mutex<tar::Builder<W>>>,
     path: PathBuf,
     dir: PathBuf,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Option<String>> {
     let mut tar = tar_lock.lock().unwrap();
     sync_hashed_read(&mut tar, &path, &dir)
 }
 
-
-const BUF_SIZE: usize = 128 * 1024;
+const READ_BUF_SIZE: usize = 256 * 1024;
 
 fn sync_hashed_read<W: Write>(
     tar: &mut tar::Builder<W>,
     path: &Path,
     dir: &Path,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Option<String>> {
     if let Some(file) = naive_open(dir.join(path))? {
         let hashed_reader = HashingReader::try_new(file)?;
-        // let mut bufread = std::io::BufReader::new(hashed_reader);
-        let mut bufread = std::io::BufReader::with_capacity(BUF_SIZE, hashed_reader);
+        let mut bufread = std::io::BufReader::with_capacity(READ_BUF_SIZE, hashed_reader);
         let len = bufread.get_ref().len();
         append_with_len(tar, path, &mut bufread, len)
             .with_context(|| format!("reading {:#?}", path))?;
-        return Ok(bufread.get_ref().finalize());
+        return Ok(Some(bufread.get_ref().finalize()));
     }
-    Ok("".into())
+    Ok(None)
 }
 
 async fn sync_add_to_tar<W: Write>(
@@ -244,7 +203,7 @@ async fn spawned_hashed_reader<W: 'static + Write + Send>(
     let hash = tokio::spawn(locked_hashed_read(tar_lock.clone(), p.clone(), d))
         .await
         .unwrap()?;
-    Ok((p, hash))
+    Ok((p, hash.unwrap_or("".into())))
 }
 
 async fn par_stream_tar(
@@ -443,10 +402,15 @@ fn serial_tar(dir: &Path, paths: &[PathBuf]) -> anyhow::Result<(Vec<u8>, HashMap
             zstd::stream::write::Encoder::new(&mut bytes, 0).context("setting up zstd encoder")?;
         let mut tar = tar::Builder::new(encoder);
         let mut checksums = HashMap::new();
-        paths.iter().for_each(|path| {
-            let hash = sync_hashed_read(&mut tar, path, dir).expect("hashing broke");
-            checksums.insert(PathBuf::from(path), hash);
-        });
+        paths.iter().map(|path| -> anyhow::Result<()>{
+            if let Some(mut file) = naive_open(dir.join(&path))? {
+                let buf = get_bytes(&mut file)?;
+                append_path_data(&mut tar, &path, &buf)?;
+                let hash = blake_hash(&buf);
+                checksums.insert(PathBuf::from(path), hash);
+            }
+            Ok(())
+        }).collect::<anyhow::Result<_>>()?;
         tar.finish().context("writing tarball")?;
         checksums
     };
@@ -463,8 +427,9 @@ fn serial_hr(dir: &Path, paths: &[PathBuf]) -> anyhow::Result<(Vec<u8>, HashMap<
         paths
             .iter()
             .map(|path| -> anyhow::Result<()> {
-                let hash = sync_hashed_read(&mut tar, path, dir).context("read/hash")?;
-                checksums.insert(path.to_owned(), hash);
+                if let Some(hash) = sync_hashed_read(&mut tar, path, dir).context("read/hash")? {
+                    checksums.insert(path.to_owned(), hash);
+                }
                 Ok(())
             })
             .collect::<anyhow::Result<Vec<()>>>()
@@ -489,7 +454,7 @@ const ITER: i32 = 1;
 // type Tarballer = dyn Fn(&Path, &[PathBuf]) -> Box<dyn Future<Output = anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)>>>;
 // type TBall = dyn Fn(&Path, &[PathBuf]) -> BoxFuture<'static, anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)>>;
 
-#[derive(Clone, Copy, Debug, Display)]
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, Hash, PartialEq, PartialOrd, Ord)]
 enum Run {
     RayonAll,
     RayonParallelThenSync,
@@ -519,10 +484,28 @@ async fn run(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    println!("Timing...");
+    let mut to_run: HashSet<Run> = HashSet::from([
+        Run::ParallelHashingReader,
+        // Run::ParallelTokioSpawn,
+        // Run::RayonAll,
+        Run::RayonHashingReader,
+        // Run::RayonParallelThenSync,
+        Run::Serial,
+        Run::SerialHashingReader,
+    ]);
+    let mut iterations = ITER;
 
     let args: Vec<String> = std::env::args().collect();
     let dir = PathBuf::from(&args[1]);
+    if args.len() > 2 {
+        // let name = String::from(&args[2]);
+        let e = Run::from_str(&args[2])?;
+        // let e = Run::try_from(name)?;
+        to_run = HashSet::from([e])
+    }
+    if args.len() > 3 {
+        iterations = args[3].parse::<i32>()?;
+    }
 
     let paths: Vec<PathBuf> = WalkDir::new(&dir)
         .into_iter()
@@ -539,26 +522,20 @@ async fn main() -> anyhow::Result<()> {
     let mut bs: HashMap<String, usize> = HashMap::new();
     let mut csums: HashMap<String, HashMap<PathBuf, String>> = HashMap::new();
 
-    let to_run = vec![
-        Run::ParallelHashingReader,
-        Run::ParallelTokioSpawn,
-        // Run::RayonAll,
-        // Run::RayonHashingReader,
-        // Run::RayonParallelThenSync,
-        // Run::Serial,
-        // Run::SerialHashingReader,
-    ];
     for e in to_run.iter() {
         let e_str = e.to_string();
-        let start = Instant::now();
         let mut run_csums: HashMap<PathBuf, String> = HashMap::new();
-        for _i in 0..ITER {
+        let mut run_bytes: usize = 0;
+        let start = Instant::now();
+        for _i in 0..iterations {
             let (bytes, r_csums) = run(*e, &dir, &paths).await?;
             run_csums = r_csums;
+            run_bytes = bytes.len();
         }
         let duration = start.elapsed();
-        csums.insert(e_str, run_csums);
-        times.insert(e.to_string(), duration);
+        csums.insert(e_str.clone(), run_csums);
+        times.insert(e_str.clone(), duration);
+        bs.insert(e_str.clone(), run_bytes);
     }
 
     let mut times: Vec<(String, Duration)> = times.into_iter().collect();
@@ -566,19 +543,17 @@ async fn main() -> anyhow::Result<()> {
     for (lbl, dur) in times {
         println!("{:14} {:?}", lbl, dur);
     }
-    // println!("{:?}", times);
-    // println!("  rayon p2s: {:?}", rayon_s_elapsed);
-    // println!("      rayon: {:?}", rayon_elapsed);
-    // println!("parallel hr: {:?}", par_hr_elapsed);
-    // println!("   parallel: {:?}", par_elapsed);
-    // println!("   rayon hr: {:?}", rayon_o_elapsed);
-    // println!("       sync: {:?}", sync_elapsed);
 
     let mut iter = csums.iter();
     let first = iter.next().unwrap();
     for sums in iter {
-        if first.1 != sums.1 {
-            eprintln!("{:?} {:?} don't match", first.0, sums.0);
+        if first.1.len() != sums.1.len() || !first.1.keys().all(|k| sums.1.contains_key(k)) {
+            eprintln!("key mismatch");
+        }
+        for k in first.1.keys() {
+            if first.1.get(k) != sums.1.get(k) {
+                eprintln!("{:?} => {:?}, {:?} => {:?}", k, first.1.get(k), k, sums.1.get(k));
+            }
         }
     }
 
