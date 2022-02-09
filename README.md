@@ -27,23 +27,22 @@ SerialHashingReader 5.908980717s
 
 # Linux box - 24 cores, 112GB Mem
 ```
-$ cargo run --release ~/.config/ -b 64 -i 10
-RayonParallelThenSync 69.377131867s
-RayonHashingReader 69.422753029s
-Serial         77.332775152s
-SerialHashingReader 80.217449183s
-RayonAll       86.131195054s
-ParallelTokioSpawn 86.521539267s
-ParallelHashingReader 89.276931043s
-key mismatch
-key mismatch
+$ cargo run --release ~/.config -i 3 -b 64
+...
+RayonParallelThenSync 3.244664736s
+SerialHashingReader 3.549346524s
+RayonHashingReader 3.574306796s
+Serial         3.607791001s
+ParallelHashingReader 3.997673462s
+ParallelTokioSpawn 4.034907148s
+RayonAll       4.075306344s
 {
-    "RayonHashingReader": 45944708,
-    "ParallelTokioSpawn": 44001781,
-    "Serial": 43705638,
-    "RayonParallelThenSync": 45349697,
-    "RayonAll": 44532780,
-    "ParallelHashingReader": 43880730,
+    "RayonAll": 44980431,
+    "ParallelHashingReader": 43841072,
+    "RayonHashingReader": 46307969,
+    "RayonParallelThenSync": 44906472,
     "SerialHashingReader": 43705638,
+    "Serial": 43705638,
+    "ParallelTokioSpawn": 43991400,
 }
 ```

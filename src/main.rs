@@ -159,14 +159,14 @@ async fn sync_add_to_tar<W: Write>(
     tar_lock: Arc<Mutex<tar::Builder<W>>>,
     path: PathBuf,
     dir: PathBuf,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Option<String>> {
     if let Some(mut file) = naive_open(dir.join(&path))? {
         let buf = get_bytes(&mut file)?;
         let mut tar = tar_lock.lock().unwrap();
         append_path_data(&mut tar, &path, &buf)?;
-        return Ok(blake_hash(&buf));
+        return Ok(Some(blake_hash(&buf)));
     }
-    Ok("".into())
+    Ok(None)
 }
 
 // This async file I/O is FAR slower than sync I/O
@@ -210,26 +210,32 @@ async fn spawned_hash<W: 'static + Write + Send>(
     tar_lock: Arc<Mutex<tar::Builder<W>>>,
     path: &Path,
     dir: &Path,
-) -> anyhow::Result<(PathBuf, String)> {
+) -> anyhow::Result<Option<(PathBuf, String)>> {
     let p = path.to_owned();
     let d = dir.to_owned();
-    let hash = tokio::spawn(sync_add_to_tar(tar_lock.clone(), p.clone(), d))
+    let maybe_hash = tokio::spawn(sync_add_to_tar(tar_lock.clone(), p.clone(), d))
         .await
         .unwrap()?;
-    Ok((p, hash))
+    if let Some(hash) = maybe_hash {
+        return Ok(Some((p, hash)))
+    }
+    Ok(None)
 }
 
 async fn spawned_hashed_reader<W: 'static + Write + Send>(
     tar_lock: Arc<Mutex<tar::Builder<W>>>,
     path: &Path,
     dir: &Path,
-) -> anyhow::Result<(PathBuf, String)> {
+) -> anyhow::Result<Option<(PathBuf, String)>> {
     let p = path.to_owned();
     let d = dir.to_owned();
-    let hash = tokio::spawn(locked_hashed_read(tar_lock.clone(), p.clone(), d))
+    let maybe_hash = tokio::spawn(locked_hashed_read(tar_lock.clone(), p.clone(), d))
         .await
         .unwrap()?;
-    Ok((p, hash.unwrap_or("".into())))
+    if let Some(hash) = maybe_hash {
+        return Ok(Some((p, hash)))
+    }
+    Ok(None)
 }
 
 async fn par_stream_tar(
@@ -246,10 +252,11 @@ async fn par_stream_tar(
         let sums: HashMap<PathBuf, String> = stream::iter(paths)
             .map(|path| async { spawned_hash(tar_lock.clone(), path, dir).await })
             .buffer_unordered(2000)
-            .try_collect::<Vec<(PathBuf, String)>>()
+            .try_collect::<Vec<Option<(PathBuf, String)>>>()
             .await
             .context("writing tar file")?
             .into_iter()
+            .filter_map(|opt| opt)
             .collect();
         let mut tar = tar_lock.lock().unwrap();
         tar.finish().context("writing tarball")?;
@@ -274,10 +281,11 @@ async fn par_hashed_reader(
         let sums: HashMap<PathBuf, String> = stream::iter(paths)
             .map(|path| async { spawned_hashed_reader(tar_lock.clone(), path, dir).await })
             .buffer_unordered(2000)
-            .try_collect::<Vec<(PathBuf, String)>>()
+            .try_collect::<Vec<Option<(PathBuf, String)>>>()
             .await
             .context("writing tar file")?
             .into_iter()
+            .filter_map(|opt| opt)
             .collect();
         let mut tar = tar_lock.lock().unwrap();
         tar.finish().context("writing tarball")?;
@@ -606,6 +614,7 @@ async fn main() -> anyhow::Result<()> {
     for sums in iter {
         if first.1.len() != sums.1.len() || !first.1.keys().all(|k| sums.1.contains_key(k)) {
             eprintln!("key mismatch");
+            eprintln!("{:?}: {:?}, {:?}: {:?}", first.0, first.1.len(), sums.0, sums.1.len());
         }
         for k in first.1.keys() {
             if first.1.get(k) != sums.1.get(k) {
