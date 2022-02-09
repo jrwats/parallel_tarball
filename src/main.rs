@@ -8,9 +8,9 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::str::FromStr;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, Mutex, mpsc::{self, SyncSender}};
 use std::time::Instant;
 use structopt::StructOpt;
 use strum_macros::EnumString;
@@ -146,7 +146,7 @@ fn sync_hashed_read<W: Write>(
     if let Some(file) = naive_open(dir.join(path))? {
         let hashed_reader = HashingReader::try_new(file)?;
         let buf = unsafe { READ_BUF };
-        let mut bufread = std::io::BufReader::with_capacity(buf, hashed_reader);
+        let mut bufread = BufReader::with_capacity(buf, hashed_reader);
         let len = bufread.get_ref().len();
         append_with_len(tar, path, &mut bufread, len)
             .with_context(|| format!("reading {:#?}", path))?;
@@ -325,8 +325,8 @@ async fn rayon_par2sync(
     paths: &[PathBuf],
 ) -> anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)> {
     let handle = {
-        let (send, recv): (std::sync::mpsc::SyncSender<(PathBuf, Vec<u8>, String)>, _) =
-            std::sync::mpsc::sync_channel(rayon::current_num_threads());
+        let (send, recv): (SyncSender<(PathBuf, Vec<u8>, String)>, _) =
+            mpsc::sync_channel(rayon::current_num_threads());
         let handle = tokio::spawn(async move {
             let mut bytes: Vec<u8> = vec![];
             let checksums = {
@@ -369,13 +369,21 @@ async fn rayon_par2sync(
     Ok(res?)
 }
 
+
+struct TarPacket {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    final_hash: Option<String>,
+}
+
 // rayon on file open only. HashingReader later
-async fn rayon_open<P: AsRef<Path> + Sync>(
+#[inline]
+async fn rayon_hr<P: AsRef<Path> + Sync>(
     dir: P,
     paths: &[PathBuf],
 ) -> anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)> {
     let result = {
-        let (send, recv): (std::sync::mpsc::SyncSender<(PathBuf, HashingReader)>, _) =
+        let (send, recv): (SyncSender<TarPacket>, _) =
             std::sync::mpsc::sync_channel(rayon::current_num_threads());
         let handle = tokio::spawn(async move {
             let mut bytes: Vec<u8> = vec![];
@@ -386,11 +394,13 @@ async fn rayon_open<P: AsRef<Path> + Sync>(
                 let mut tar = tar::Builder::new(encoder);
 
                 let mut checksums = HashMap::new();
-                for (path, mut hasher) in recv.into_iter() {
-                    let len = hasher.len();
-                    append_with_len(&mut tar, &path, &mut hasher, len)
-                        .with_context(|| format!("Writing {:#?} into tarball", &path))?;
-                    checksums.insert(path, hasher.finalize());
+                for packet in recv.into_iter() {
+                    let len = packet.bytes.len();
+                    append_with_len(&mut tar, &packet.path, packet.bytes.as_slice(), len as u64)
+                        .with_context(|| format!("Writing {:#?} into tarball", &packet.path))?;
+                    if let Some(hash) = packet.final_hash {
+                        checksums.insert(packet.path, hash);
+                    }
                 }
                 tar.finish().context("writing tarball")?;
                 checksums
@@ -403,8 +413,29 @@ async fn rayon_open<P: AsRef<Path> + Sync>(
             .map(|path: &PathBuf| -> anyhow::Result<()> {
                 let open_result = maybe_open(dir.as_ref().join(&path));
                 if let Ok(Some(file)) = open_result {
-                    let reader = HashingReader::try_new(file)?;
-                    send.send((path.to_owned(), reader))?;
+                    let buf_size = unsafe { READ_BUF };
+                    let mut reader = HashingReader::try_new(file)?;
+                    loop {
+                        let mut v = Vec::with_capacity(buf_size);
+                        unsafe { v.set_len(buf_size); }
+                        let len = reader.read(v.as_mut())?;
+                        unsafe { v.set_len(len); }
+                        let final_hash = if len < buf_size {
+                            Some(reader.finalize())
+                        } else { 
+                            None
+                        };
+
+                        let packet = TarPacket {
+                            path: path.to_owned(),
+                            bytes: v,
+                            final_hash,
+                        };
+                        send.send(packet)?;
+                        if len < buf_size {
+                            break;
+                        }
+                    }
                 } else if let Err(e) = open_result {
                     // It's possible we encounter a file we can't read on disk, like a socket.
                     // Don't fail a `dotsync push` for this.  Log it:
@@ -500,7 +531,7 @@ async fn run(
     match run_type {
         Runner::RayonAll => rayon_tar(dir, paths),
         Runner::RayonParallelThenSync => rayon_par2sync(dir, paths).await,
-        Runner::RayonHashingReader => rayon_open(dir, paths).await,
+        Runner::RayonHashingReader => rayon_hr(dir, paths).await,
         Runner::ParallelTokioSpawn => par_stream_tar(dir, paths).await,
         Runner::ParallelHashingReader => par_hashed_reader(dir, paths).await,
         Runner::Serial => serial_tar(dir, paths),
@@ -583,7 +614,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("{:?}", bs);
+    println!("{:#?}", bs);
     Ok(())
 }
 
