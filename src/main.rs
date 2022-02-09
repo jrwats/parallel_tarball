@@ -10,7 +10,7 @@ use std::fs::File;
 use std::str::FromStr;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc::{self, SyncSender}};
+use std::sync::{Arc, Mutex, mpsc::{self, Sender, SyncSender}};
 use std::time::Instant;
 use structopt::StructOpt;
 use strum_macros::EnumString;
@@ -371,14 +371,12 @@ async fn rayon_par2sync(
     Ok(res?)
 }
 
-
 struct TarPacket {
     path: PathBuf,
     bytes: Vec<u8>,
     final_hash: Option<String>,
 }
 
-// rayon on file open only. HashingReader later
 #[inline]
 async fn rayon_hr<P: AsRef<Path> + Sync>(
     dir: P,
@@ -418,6 +416,85 @@ async fn rayon_hr<P: AsRef<Path> + Sync>(
                     let buf_size = unsafe { READ_BUF };
                     let mut reader = HashingReader::try_new(file)?;
                     loop {
+                        let mut v = vec![0; buf_size];
+                        let len = reader.read(v.as_mut())?;
+                        unsafe { v.set_len(len); }
+                        let final_hash = if len < buf_size {
+                            Some(reader.finalize())
+                        } else { 
+                            None
+                        };
+
+                        let packet = TarPacket {
+                            path: path.to_owned(),
+                            bytes: v,
+                            final_hash,
+                        };
+                        send.send(packet)?;
+                        if len < buf_size {
+                            break;
+                        }
+                    }
+                } else if let Err(e) = open_result {
+                    // It's possible we encounter a file we can't read on disk, like a socket.
+                    // Don't fail a `dotsync push` for this.  Log it:
+                    // TODO: surface these to user somehow?
+                    eprintln!("{:?}", e);
+                }
+                Ok(())
+            })
+            .collect();
+        handle
+    }
+    .await
+    .context("tokio join handle failure")?;
+    Ok(result?)
+}
+
+#[inline]
+async fn rayon_hr_ac<P: AsRef<Path> + Sync>(
+    dir: P,
+    paths: &[PathBuf],
+) -> anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)> {
+    let result = {
+        let (send, recv): (Sender<TarPacket>, _) = mpsc::channel();
+        let handle = tokio::spawn(async move {
+            let mut bytes: Vec<u8> = vec![];
+            let checksums = {
+                let encoder = zstd::stream::write::Encoder::new(&mut bytes, 0)
+                    .context("setting up zstd encoder")?
+                    .auto_finish();
+                let mut tar = tar::Builder::new(encoder);
+
+                let mut checksums = HashMap::new();
+                for packet in recv.into_iter() {
+                    let len = packet.bytes.len();
+                    append_with_len(&mut tar, &packet.path, packet.bytes.as_slice(), len as u64)
+                        .with_context(|| format!("Writing {:#?} into tarball", &packet.path))?;
+                    if let Some(hash) = packet.final_hash {
+                        checksums.insert(packet.path, hash);
+                    }
+                }
+                tar.finish().context("writing tarball")?;
+                checksums
+            };
+            Ok::<(Vec<u8>, HashMap<PathBuf, String>), anyhow::Error>((bytes, checksums))
+        });
+
+        let parent = dir.as_ref();
+        let path_senders: Vec<(PathBuf, Sender<TarPacket>)> = paths
+            .into_iter()
+            .map(|p| (p.to_path_buf(), send.clone()))
+            .collect();
+
+        let _: Vec<_> = path_senders
+            .into_par_iter()
+            .map(move |(path, sender)| -> anyhow::Result<()> {
+                let open_result = maybe_open(parent.join(&path));
+                if let Ok(Some(file)) = open_result {
+                    let buf_size = unsafe { READ_BUF };
+                    let mut reader = HashingReader::try_new(file)?;
+                    loop {
                         let mut v = Vec::with_capacity(buf_size);
                         unsafe { v.set_len(buf_size); }
                         let len = reader.read(v.as_mut())?;
@@ -433,7 +510,7 @@ async fn rayon_hr<P: AsRef<Path> + Sync>(
                             bytes: v,
                             final_hash,
                         };
-                        send.send(packet)?;
+                        sender.send(packet)?;
                         if len < buf_size {
                             break;
                         }
@@ -518,6 +595,7 @@ enum Runner {
     RayonAll,
     RayonParallelThenSync,
     RayonHashingReader,
+    RayonHashReadAsyncChan,
     ParallelTokioSpawn,
     ParallelHashingReader,
     Serial,
@@ -534,6 +612,7 @@ async fn run(
         Runner::RayonAll => rayon_tar(dir, paths),
         Runner::RayonParallelThenSync => rayon_par2sync(dir, paths).await,
         Runner::RayonHashingReader => rayon_hr(dir, paths).await,
+        Runner::RayonHashReadAsyncChan => rayon_hr_ac(dir, paths).await,
         Runner::ParallelTokioSpawn => par_stream_tar(dir, paths).await,
         Runner::ParallelHashingReader => par_hashed_reader(dir, paths).await,
         Runner::Serial => serial_tar(dir, paths),
@@ -548,6 +627,7 @@ async fn main() -> anyhow::Result<()> {
         Runner::ParallelTokioSpawn,
         Runner::RayonAll,
         Runner::RayonHashingReader,
+        Runner::RayonHashReadAsyncChan,
         Runner::RayonParallelThenSync,
         Runner::Serial,
         Runner::SerialHashingReader,
