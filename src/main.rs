@@ -40,7 +40,6 @@ struct Args {
 struct HashingReader {
     file: File,
     hasher: blake3::Hasher,
-    len: u64,
 }
 
 impl Read for HashingReader {
@@ -54,14 +53,8 @@ impl Read for HashingReader {
 
 impl HashingReader {
     fn try_new(file: File) -> anyhow::Result<Self> {
-        let metadata = file.metadata().context("reading metadata")?;
-        let len = metadata.len();
         let hasher = blake3::Hasher::new();
-        Ok(Self { file, hasher, len })
-    }
-
-    fn len(&self) -> u64 {
-        self.len
+        Ok(Self { file, hasher })
     }
 
     #[inline]
@@ -144,10 +137,11 @@ fn sync_hashed_read<W: Write>(
     dir: &Path,
 ) -> anyhow::Result<Option<String>> {
     if let Some(file) = naive_open(dir.join(path))? {
+        let metadata = file.metadata().context("reading metadata")?;
+        let len = metadata.len() as u64;
         let hashed_reader = HashingReader::try_new(file)?;
         let buf = unsafe { READ_BUF };
         let mut bufread = BufReader::with_capacity(buf, hashed_reader);
-        let len = bufread.get_ref().len();
         append_with_len(tar, path, &mut bufread, len)
             .with_context(|| format!("reading {:#?}", path))?;
         return Ok(Some(bufread.get_ref().finalize()));
