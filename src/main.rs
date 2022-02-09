@@ -8,13 +8,34 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::str::FromStr;
-use std::io::{self, IoSliceMut, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
 use std::time::Instant;
+use structopt::StructOpt;
 use strum_macros::EnumString;
 use tokio::io::AsyncReadExt;
 use walkdir::WalkDir;
+
+#[derive(StructOpt, Debug)]
+struct Args {
+    /// Directory to scan
+    dir: String,
+
+    /// Limit the runner methods to these type(s) (useful for strace)
+    #[structopt(short, long)]
+    methods: Option<Vec<String>>,
+
+    /// number of iterations to perform
+    #[structopt(short, long)]
+    iterations: Option<i32>,
+
+    /// Read buffer size (in KB) for the BufReader wrapper around HashingReader
+    /// i.e. RayonAll, RayonParallelThenSync, RayonHashingReader, ParallelTokioSpawn,
+    ///      ParallelHashingReader, Serial, SerialHashingReader,
+    #[structopt(short, long)]
+    buffer_size: Option<usize>,
+}
 
 struct HashingReader {
     file: File,
@@ -111,7 +132,11 @@ async fn locked_hashed_read<W: Write>(
     sync_hashed_read(&mut tar, &path, &dir)
 }
 
-const READ_BUF_SIZE: usize = 256 * 1024;
+static mut READ_BUF: usize = 256 * 1024; // 256KB
+
+unsafe fn set_buf_size(kb: usize) {
+    READ_BUF = kb * 1024;
+}
 
 fn sync_hashed_read<W: Write>(
     tar: &mut tar::Builder<W>,
@@ -120,7 +145,8 @@ fn sync_hashed_read<W: Write>(
 ) -> anyhow::Result<Option<String>> {
     if let Some(file) = naive_open(dir.join(path))? {
         let hashed_reader = HashingReader::try_new(file)?;
-        let mut bufread = std::io::BufReader::with_capacity(READ_BUF_SIZE, hashed_reader);
+        let buf = unsafe { READ_BUF };
+        let mut bufread = std::io::BufReader::with_capacity(buf, hashed_reader);
         let len = bufread.get_ref().len();
         append_with_len(tar, path, &mut bufread, len)
             .with_context(|| format!("reading {:#?}", path))?;
@@ -455,7 +481,7 @@ const ITER: i32 = 1;
 // type TBall = dyn Fn(&Path, &[PathBuf]) -> BoxFuture<'static, anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)>>;
 
 #[derive(Clone, Copy, Debug, Display, EnumString, Eq, Hash, PartialEq, PartialOrd, Ord)]
-enum Run {
+enum Runner {
     RayonAll,
     RayonParallelThenSync,
     RayonHashingReader,
@@ -467,44 +493,44 @@ enum Run {
 
 #[inline]
 async fn run(
-    run_type: Run,
+    run_type: Runner,
     dir: &Path,
     paths: &[PathBuf]
 ) -> anyhow::Result<(Vec<u8>, HashMap<PathBuf, String>)> {
     match run_type {
-        Run::RayonAll => rayon_tar(dir, paths),
-        Run::RayonParallelThenSync => rayon_par2sync(dir, paths).await,
-        Run::RayonHashingReader => rayon_open(dir, paths).await,
-        Run::ParallelTokioSpawn => par_stream_tar(dir, paths).await,
-        Run::ParallelHashingReader => par_hashed_reader(dir, paths).await,
-        Run::Serial => serial_tar(dir, paths),
-        Run::SerialHashingReader => serial_hr(dir, paths),
+        Runner::RayonAll => rayon_tar(dir, paths),
+        Runner::RayonParallelThenSync => rayon_par2sync(dir, paths).await,
+        Runner::RayonHashingReader => rayon_open(dir, paths).await,
+        Runner::ParallelTokioSpawn => par_stream_tar(dir, paths).await,
+        Runner::ParallelHashingReader => par_hashed_reader(dir, paths).await,
+        Runner::Serial => serial_tar(dir, paths),
+        Runner::SerialHashingReader => serial_hr(dir, paths),
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut to_run: HashSet<Run> = HashSet::from([
-        Run::ParallelHashingReader,
-        // Run::ParallelTokioSpawn,
-        // Run::RayonAll,
-        Run::RayonHashingReader,
-        // Run::RayonParallelThenSync,
-        Run::Serial,
-        Run::SerialHashingReader,
+    let mut to_run: HashSet<Runner> = HashSet::from([
+        Runner::ParallelHashingReader,
+        Runner::ParallelTokioSpawn,
+        Runner::RayonAll,
+        Runner::RayonHashingReader,
+        Runner::RayonParallelThenSync,
+        Runner::Serial,
+        Runner::SerialHashingReader,
     ]);
-    let mut iterations = ITER;
 
-    let args: Vec<String> = std::env::args().collect();
-    let dir = PathBuf::from(&args[1]);
-    if args.len() > 2 {
-        // let name = String::from(&args[2]);
-        let e = Run::from_str(&args[2])?;
-        // let e = Run::try_from(name)?;
-        to_run = HashSet::from([e])
+    let args = Args::from_args();
+    eprintln!("{:?}", args);
+
+    let dir = PathBuf::from(args.dir);
+    if let Some(runners) = args.methods {
+        to_run = runners.iter().map(|r| Ok(Runner::from_str(r)?))
+            .collect::<anyhow::Result<_>>()?
     }
-    if args.len() > 3 {
-        iterations = args[3].parse::<i32>()?;
+    let iterations = args.iterations.unwrap_or(ITER);
+    if let Some(buffer_size) = args.buffer_size {
+        unsafe { set_buf_size(buffer_size) };
     }
 
     let paths: Vec<PathBuf> = WalkDir::new(&dir)
