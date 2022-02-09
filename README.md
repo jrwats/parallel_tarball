@@ -27,11 +27,23 @@ SerialHashingReader 5.908980717s
 
 # Linux box - 24 cores, 112GB Mem
 ```
- $ cargo run --release /some/dir/with/lots/of/javascript/files
-Timing...
-     rayon: 20.466664974s
- rayon p2s: 14.468034459s
-  parallel: 21.965607378s
-      sync: 18.48489502s
-{"syn": 960857322, "rayon": 975555982, "rayon p2s": 995650276, "parallel": 965608098}
+$ cargo run --release ~/.config/ -b 64 -i 10
+RayonParallelThenSync 69.377131867s
+RayonHashingReader 69.422753029s
+Serial         77.332775152s
+SerialHashingReader 80.217449183s
+RayonAll       86.131195054s
+ParallelTokioSpawn 86.521539267s
+ParallelHashingReader 89.276931043s
+key mismatch
+key mismatch
+{
+    "RayonHashingReader": 45944708,
+    "ParallelTokioSpawn": 44001781,
+    "Serial": 43705638,
+    "RayonParallelThenSync": 45349697,
+    "RayonAll": 44532780,
+    "ParallelHashingReader": 43880730,
+    "SerialHashingReader": 43705638,
+}
 ```
